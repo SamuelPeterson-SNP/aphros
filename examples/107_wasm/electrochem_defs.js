@@ -21,7 +21,8 @@ set int hypre_symm_miniter 5
 set double visvel 0
 set double visvf 0.7
 set double visvort 0
-set double vispot 1
+set double vispot 0
+set double vistracer 1
 set int visinterp 1
 set int sharpen 1
 set double dtmax 0.1
@@ -34,6 +35,12 @@ set double coalth 0.1
 
 set double resist1 100
 set double resist2 1
+
+set vect tracer_density 1 1
+set vect tracer_diffusion 0.01 0.01
+set vect tracer_diameter 0 0
+set vect tracer_viscosity 0 0
+set string tracer_scheme superbee
 `
 }
 

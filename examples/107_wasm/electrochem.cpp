@@ -27,6 +27,7 @@
 #include "solver/electro.h"
 #include "solver/proj.h"
 #include "solver/solver.h"
+#include "solver/tracer.h"
 #include "solver/vof.h"
 #include "util/format.h"
 #include "util/hydro.ipp"
@@ -83,6 +84,7 @@ class Solver : public KernelMeshPar<M, Par> {
   FieldCell<Scal> fc_mu;
   FieldCell<Scal> fc_curv;
   FieldCell<Vect> fc_force;
+  FieldCell<Scal> fc_tracer_src;
   FieldEmbed<Scal> ff_bforce;
   MapEmbed<BCondAdvection<Scal>> bc_vof;
   MapEmbed<BCondFluid<Vect>> bc_fluid;
@@ -96,6 +98,7 @@ class Solver : public KernelMeshPar<M, Par> {
   typename PartStrMeshM<M>::Par psm_par;
   typename Vof<M>::Par vof_par;
   std::shared_ptr<linear::Solver<M>> linsolver;
+  std::unique_ptr<TracerInterface<M>> tracer;
 };
 
 struct Canvas {
@@ -189,18 +192,33 @@ static void RenderField(
     Canvas& canvas, const FieldCell<Scal>& fcu, const FieldCell<Vect>& fcvel,
     const MapEmbed<BCond<Vect>>& bc_vel, const MapEmbed<BCond<Scal>>& bc_vort,
     const FieldCell<Scal>& fcp, FieldCell<Scal> fc_pot,
-    const MapEmbed<BCond<Scal>>& bc_pot, bool interpolate, const M& m) {
+    const MapEmbed<BCond<Scal>>& bc_pot, Multi<FieldCell<Scal>> fc_tracer,
+    const Multi<MapEmbed<BCond<Scal>>>& bc_tracer, bool interpolate,
+    const M& m) {
   auto fcvelbc = fcvel;
   auto fc_vort = GetVortScal(fcvel, bc_vel, m);
-  // fill halo cells
-  BcApply<Vect>(fcvelbc, bc_vel, m);
-  BcApply<Scal>(fc_vort, bc_vort, m);
-  BcApply<Scal>(fc_pot, bc_pot, m);
   const auto msize = m.GetGlobalSize();
   const Scal visvel = g_var.Double("visvel", 0);
   const Scal visvort = g_var.Double("visvort", 0);
   const Scal visvf = g_var.Double("visvf", 0);
   const Scal vispot = g_var.Double("vispot", 0);
+  const Scal vistracer = g_var.Double("vistracer", 0);
+
+  // fill halo cells
+  if (visvel) {
+    BcApply<Vect>(fcvelbc, bc_vel, m);
+  }
+  if (visvort) {
+    BcApply<Scal>(fc_vort, bc_vort, m);
+  }
+  if (vispot) {
+    BcApply<Scal>(fc_pot, bc_pot, m);
+  }
+  if (vistracer) {
+    BcApply<Scal>(fc_tracer[0], bc_tracer[0], m);
+    BcApply<Scal>(fc_tracer[1], bc_tracer[1], m);
+  }
+
   using Vect3 = generic::Vect<Scal, 3>;
   using MIdx3 = generic::Vect<unsigned char, 3>;
   auto get_color = [&](IdxCell c) -> Vect3 {
@@ -231,6 +249,16 @@ static void RenderField(
     }
     if (visvf) {
       q = interp::Linear(visvf * fcu[c], Vect3(q), Vect3(0, 0.8, 0.42));
+    }
+    if (vistracer) {
+      const auto u0 = fc_tracer[0][c];
+      const auto u1 = fc_tracer[1][c];
+      const auto f0 = Clamp(std::abs(u0 * vistracer));
+      const auto f1 = Clamp(std::abs(u1 * vistracer));
+      q = interp::Bilinear(
+          f0, f1, //
+          Vect3(1, 1, 1), Vect3(1, 0.12, 0.35), //
+          Vect3(0, 0.6, 0.87), Vect3(0, 0.8, 0.42));
     }
     return q;
   };
@@ -301,18 +329,31 @@ void Solver::Run() {
       linsolver = ULinear<M>::MakeLinearSolver(var, "symm", m);
       FieldCell<Vect> fcvel(m, Vect(0));
 
-      typename ElectroInterface<M>::Conf conf{var, linsolver};
-      electro.reset(new Electro<M>(m, m, bc_electro, 0, conf));
+      { // electro
+        typename ElectroInterface<M>::Conf conf{var, linsolver};
+        electro.reset(new Electro<M>(m, m, bc_electro, 0, conf));
+      }
+
+      const size_t ntracers = 2;
+      Multi<MapEmbed<BCond<Scal>>> bc_tracer(ntracers);
 
       const auto topvel = var.Double["topvel"];
       for (auto f : m.AllFacesM()) {
         size_t nci;
         if (m.IsBoundary(f, nci)) {
+          const bool f_bottom = (f.direction() == 1 && f[1] == 0);
+          const bool f_top =
+              (f.direction() == 1 && f[1] == m.GetGlobalSize()[1]);
+          /*
+          const bool f_left = (f.direction() == 0 && f[0] == 0);
+          const bool f_right =
+              (f.direction() == 0 && f[0] == m.GetGlobalSize()[0]);
+              */
           { // fluid
             auto& bc = bc_fluid[f];
             bc.nci = nci;
             bc.type = BCondFluidType::wall;
-            if (topvel && f[1] == m.GetGlobalSize()[1]) {
+            if (topvel && f_top) {
               bc.type = BCondFluidType::slipwall;
               bc.velocity = Vect(topvel, 0);
             }
@@ -331,19 +372,62 @@ void Solver::Run() {
           { // electro
             auto& bc = bc_electro[f];
             bc.nci = nci;
-            if (f.direction() == 1) {
+            if (f_top || f_bottom) {
               bc.type = BCondType::dirichlet;
-              bc.val = (f[1] == 0 ? 1 : -1);
+              bc.val = (f_bottom ? 1 : -1);
             } else {
               bc.type = BCondType::neumann;
             }
           }
+          { // tracer
+            for (size_t i = 0; i < ntracers; ++i) {
+              auto& bc = bc_tracer[i][f];
+              bc.nci = nci;
+              if (f_top && i == 0) {
+                bc.type = BCondType::dirichlet;
+                bc.val = 1;
+              } else if (f_bottom && i == 1) {
+                bc.type = BCondType::dirichlet;
+                bc.val = 1;
+              } else {
+                bc.type = BCondType::neumann;
+              }
+            }
+          }
         }
       }
-      const ProjArgs<M> args{fcvel,     bc_fluid,   mc_velcond, &fc_rho, &fc_mu,
-                             &fc_force, &ff_bforce, &fc_src,    &fc_src, 0,
-                             s.dt,      linsolver,  p};
-      fluid.reset(new Proj<M>(m, m, args));
+
+      { // tracer
+        fc_tracer_src.Reinit(m, 0);
+        typename TracerInterface<M>::Conf conf;
+        conf.layers = ntracers;
+        auto multi = [](const std::vector<Scal>& v) {
+          Multi<Scal> w(v.size());
+          w.data() = v;
+          return w;
+        };
+        conf.density = multi(var.Vect["tracer_density"]);
+        conf.diffusion = multi(var.Vect["tracer_diffusion"]);
+        conf.diameter = multi(var.Vect["tracer_diameter"]);
+        conf.viscosity = multi(var.Vect["tracer_viscosity"]);
+        conf.scheme = GetConvSc(var.String["tracer_scheme"]);
+        conf.slip.resize(conf.layers);
+        conf.fc_src = &fc_tracer_src;
+        using SlipType = typename TracerInterface<M>::SlipType;
+        for (size_t i = 0; i < conf.layers; ++i) {
+          conf.slip[i].type = SlipType::none;
+        }
+        Multi<FieldCell<Scal>> vfcu(GRange<size_t>(ntracers), m, 0);
+        tracer.reset(new Tracer<M>(m, m, vfcu, bc_tracer, 0, conf));
+      }
+
+      { // fluid
+        const ProjArgs<M> args{fcvel,   bc_fluid,  mc_velcond, &fc_rho,
+                               &fc_mu,  &fc_force, &ff_bforce, &fc_src,
+                               &fc_src, 0,         s.dt,       linsolver,
+                               p};
+        fluid.reset(new Proj<M>(m, m, args));
+      }
     }
     {
       auto& p = vof_par;
@@ -382,6 +466,9 @@ void Solver::Run() {
   }
   if (sem.Nested("electro-step")) {
     electro->Step(fluid->GetTimeStep(), vof->GetField());
+  }
+  if (sem.Nested("tracer-step")) {
+    tracer->Step(fluid->GetTimeStep(), fluid->GetVolumeFlux());
   }
   if (sem("maxvel")) {
     maxvel = 0;
@@ -459,6 +546,7 @@ void Solver::Run() {
       RenderField(
           *g_canvas, vof->GetField(), fluid->GetVelocity(), bc_vel, bc_vort,
           fluid->GetPressure(), electro->GetPotential(), bc_electro,
+          tracer->GetVolumeFraction(), tracer->GetBCondMutable(),
           var.Int["visinterp"], m);
 
       // Render interface lines
