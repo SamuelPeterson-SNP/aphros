@@ -67,6 +67,7 @@ class Solver : public KernelMeshPar<M, Par> {
   Solver(Vars& var_, const BlockInfoProxy& proxy, Par& par)
       : KernelMeshPar<M, Par>(var_, proxy, par)
       , fc_src(m, 0)
+      , fc_src2(m, 0)
       , fc_rho(m, 1)
       , fc_mu(m, 0)
       , fc_force(m, Vect(0))
@@ -80,11 +81,12 @@ class Solver : public KernelMeshPar<M, Par> {
 
  private:
   FieldCell<Scal> fc_src;
+  FieldCell<Scal> fc_src2;
   FieldCell<Scal> fc_rho;
   FieldCell<Scal> fc_mu;
   FieldCell<Scal> fc_curv;
   FieldCell<Vect> fc_force;
-  FieldCell<Scal> fc_tracer_src;
+  FieldCell<Scal> fc_src_tracer;
   FieldEmbed<Scal> ff_bforce;
   MapEmbed<BCondAdvection<Scal>> bc_vof;
   MapEmbed<BCondFluid<Vect>> bc_fluid;
@@ -216,7 +218,7 @@ static void RenderField(
   }
   if (vistracer) {
     BcApply<Scal>(fc_tracer[0], bc_tracer[0], m);
-    BcApply<Scal>(fc_tracer[1], bc_tracer[1], m);
+    //BcApply<Scal>(fc_tracer[1], bc_tracer[1], m);
   }
 
   using Vect3 = generic::Vect<Scal, 3>;
@@ -252,13 +254,16 @@ static void RenderField(
     }
     if (vistracer) {
       const auto u0 = fc_tracer[0][c];
-      const auto u1 = fc_tracer[1][c];
+      //const auto u1 = fc_tracer[1][c];
       const auto f0 = Clamp(std::abs(u0 * vistracer));
-      const auto f1 = Clamp(std::abs(u1 * vistracer));
+      //const auto f1 = Clamp(std::abs(u1 * vistracer));
+      /*
       q = interp::Bilinear(
           f0, f1, //
           Vect3(1, 1, 1), Vect3(1, 0.12, 0.35), //
           Vect3(0, 0.6, 0.87), Vect3(0, 0.8, 0.42));
+          */
+      q = interp::Linear(f0, Vect3(1, 1, 1), Vect3(1, 0.12, 0.35));
     }
     return q;
   };
@@ -386,7 +391,7 @@ void Solver::Run() {
               if (f_top && i == 0) {
                 bc.type = BCondType::dirichlet;
                 bc.val = 1;
-              } else if (f_bottom && i == 1) {
+              } else if (f_bottom && i == 0) {
                 bc.type = BCondType::dirichlet;
                 bc.val = 1;
               } else {
@@ -398,7 +403,7 @@ void Solver::Run() {
       }
 
       { // tracer
-        fc_tracer_src.Reinit(m, 0);
+        fc_src_tracer.Reinit(m, 0);
         typename TracerInterface<M>::Conf conf;
         conf.layers = ntracers;
         auto multi = [](const std::vector<Scal>& v) {
@@ -412,7 +417,7 @@ void Solver::Run() {
         conf.viscosity = multi(var.Vect["tracer_viscosity"]);
         conf.scheme = GetConvSc(var.String["tracer_scheme"]);
         conf.slip.resize(conf.layers);
-        conf.fc_src = &fc_tracer_src;
+        conf.fc_src = &fc_src_tracer;
         using SlipType = typename TracerInterface<M>::SlipType;
         for (size_t i = 0; i < conf.layers; ++i) {
           conf.slip[i].type = SlipType::none;
@@ -436,7 +441,7 @@ void Solver::Run() {
       FieldCell<Scal> fccl(m, 0);
       fc_curv.Reinit(m, 0);
       vof.reset(new Vof<M>(
-          m, m, fcu, fccl, bc_vof, &fluid->GetVolumeFlux(), &fc_src, 0, s.dt,
+          m, m, fcu, fccl, bc_vof, &fluid->GetVolumeFlux(), &fc_src2, 0, s.dt,
           p));
     }
 
@@ -517,6 +522,17 @@ void Solver::Run() {
 
     const FieldFace<Scal> ff_sigma(m, var.Double["sigma"]);
     AppendSurfaceTension(m, ff_bforce, vof->GetField(), fc_curv, ff_sigma);
+
+    if (auto* rate = var.Double.Find("growth_rate")) {
+      const auto& fcvf = vof->GetField();
+      const auto& trvf0 = tracer->GetVolumeFraction()[0];
+      for (auto c : m.Cells()) {
+        auto src2 = trvf0[c] * (*rate) * fcvf[c];
+        fc_src2[c] = src2;
+        fc_src_tracer[c] = -src2;
+        fc_src[c] = src2;
+      }
+    }
   }
   if (sem("init") && s.to_init_field) {
     vof->AddModifier([&](FieldCell<Scal>& fcu, FieldCell<Scal>&,

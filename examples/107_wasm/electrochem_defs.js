@@ -12,9 +12,9 @@ function GetExtraConfig() {
   return `
 set double rho1 1
 set double mu1 0.0004
-set double rho2 10
-set double mu2 0.004
-set vect gravity 0 -5
+set double rho2 0.1
+set double mu2 0.00004
+set vect gravity 0 -20
 set double hypre_symm_tol 1e-2
 set int hypre_symm_maxiter 20
 set int hypre_symm_miniter 5
@@ -32,6 +32,8 @@ set double cfl 0.9
 set double cflvis 0.125
 set double cflsurf 2
 set double coalth 0.1
+
+set double growth_rate 100
 
 set double resist1 100
 set double resist2 1
